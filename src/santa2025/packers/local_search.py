@@ -1,23 +1,15 @@
 """
 Local search refinements for the Santa 2025 Christmas Tree Packing project.
 
-This module implements *geometry-level* improvement steps on top of a baseline
+This module implements geometry-level improvement steps on top of a baseline
 layout (for example the hexagonal lattice from `hex_lattice.py`).
 
-The primary API is:
+Main pieces:
 
-    refine_layout(poses, iters=..., move_scale=..., angle_scale=...)
-
-which performs a simple hill-climbing / (optional) annealing-style local search:
-
-- At each step, pick one tree at random.
-- Propose a small perturbation in position (dx, dy) and angle (d_angle).
-- Reject moves that cause overlaps or go outside coordinate bounds.
-- Accept moves that reduce the bounding square side.
-- Optionally accept some worse moves with a probability that decays over time
-  (simulated annealing flavor).
-
-The refinement operates *in-place* on the given list of `TreePose` instances.
+- bounding_square_side(poses): fast objective for a set of TreePose objects.
+- has_any_collision(poses): conservative collision check.
+- radial_compact_layout(poses): global radial scaling toward the origin.
+- refine_layout(poses, ...): single-tree hill-climbing / annealing local search.
 """
 
 from __future__ import annotations
@@ -26,8 +18,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Callable
 import math
 import random
-
-from shapely.strtree import STRtree
 
 from ..geometry import TreePose
 from ..config import (
@@ -44,28 +34,21 @@ from ..config import (
 
 def bounding_square_side(poses: List[TreePose]) -> float:
     """
-    Compute the side length of the smallest axis aligned square that
+    Compute the side length of the smallest axis-aligned square that
     contains all polygons in `poses`.
 
-    This is similar in spirit to `evaluation.bounding_square_side_for_group`,
-    but operates directly on a list of `TreePose` objects.
+    This mirrors evaluation.bounding_square_side_for_group but operates
+    directly on a list of TreePose objects, and avoids an expensive
+    unary_union().
 
-    Implementation note
-    -------------------
-    The naive version used shapely.ops.unary_union(...) which becomes
-    expensive when called thousands of times in local search loops.
-
-    Because valid layouts never have overlapping trees, the bounding box
-    of the union is identical to the bounding box of the individual
-    polygons. So we can just aggregate bounds in O(N) without building
-    any unions.
+    Since valid layouts never have overlapping trees, the bounding box
+    of the union is equal to the bounding box of the individual polygons.
     """
     if not poses:
         return 0.0
 
     polys = [p.poly for p in poses]
 
-    # Each .bounds is (minx, miny, maxx, maxy)
     minx = min(g.bounds[0] for g in polys)
     miny = min(g.bounds[1] for g in polys)
     maxx = max(g.bounds[2] for g in polys)
@@ -82,15 +65,17 @@ def has_any_collision(poses: List[TreePose]) -> bool:
 
     Trees that only touch along edges or points are considered OK
     (no collision) – this matches the competition's notion of overlap.
+
+    This uses a simple O(N^2) loop, which is fine for N <= 200 and
+    avoids the overhead of rebuilding a spatial index repeatedly.
     """
     polys = [p.poly for p in poses]
-    index = STRtree(polys)
-    for i, poly in enumerate(polys):
-        candidates = index.query(poly)
-        for j in candidates:
-            if i == j:
-                continue
-            if poly.intersects(polys[j]) and not poly.touches(polys[j]):
+    n = len(polys)
+    for i in range(n):
+        pi = polys[i]
+        for j in range(i + 1, n):
+            pj = polys[j]
+            if pi.intersects(pj) and not pi.touches(pj):
                 return True
     return False
 
@@ -100,6 +85,82 @@ def _coords_in_bounds(x: float, y: float) -> bool:
     Check that (x, y) lies inside the allowed coordinate range.
     """
     return (COORD_MIN <= x <= COORD_MAX) and (COORD_MIN <= y <= COORD_MAX)
+
+
+# ---------------------------------------------------------------------------
+# Global radial compaction
+# ---------------------------------------------------------------------------
+
+def radial_compact_layout(
+    poses: List[TreePose],
+    max_steps: int = 20,
+    tol: float = 1e-4,
+) -> float:
+    """
+    Uniformly scale all tree centers toward the origin:
+
+        (x, y) -> (f * x, f * y),   0 < f <= 1
+
+    and find the smallest scaling factor `f` that still yields a valid,
+    non-overlapping layout.
+
+    We assume the incoming poses are already valid (no collisions).
+
+    Parameters
+    ----------
+    poses:
+        List of TreePose objects.
+    max_steps:
+        Maximum number of bisection steps.
+    tol:
+        Early-stop threshold on the search interval length.
+
+    Returns
+    -------
+    float
+        The final scaling factor f in (0, 1]; 1.0 means no compaction
+        was possible beyond the original layout.
+    """
+    if not poses:
+        return 1.0
+
+    # Save original positions/angles so we can recompute from a clean
+    # reference at each trial factor.
+    orig_state = [(p.x, p.y, p.angle) for p in poses]
+
+    # Invariant: hi is always a *safe* (non-colliding) factor.
+    lo = 0.0   # treated as "definitely colliding" (we never evaluate at 0)
+    hi = 1.0   # original layout, known to be safe
+    best_safe = hi
+
+    for _ in range(max_steps):
+        if hi - lo < tol:
+            break
+
+        mid = 0.5 * (lo + hi)
+
+        # Apply mid scaling from original state
+        for p, (ox, oy, ang) in zip(poses, orig_state):
+            p.x = ox * mid
+            p.y = oy * mid
+            p.angle = ang
+            p.update()
+
+        # If mid produces collisions, safe region is to the right (larger f).
+        if has_any_collision(poses):
+            lo = mid
+        else:
+            hi = mid
+            best_safe = mid
+
+    # Finally, apply the best safe factor to the real layout.
+    for p, (ox, oy, ang) in zip(poses, orig_state):
+        p.x = ox * best_safe
+        p.y = oy * best_safe
+        p.angle = ang
+        p.update()
+
+    return best_safe
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +184,7 @@ class LocalSearchStats:
         return self.initial_side - self.final_side
 
 
-def _default_temperature_schedule(
-    step: int,
-    iters: int,
-    temp_start: float,
-    temp_end: float,
-) -> float:
+def _default_temperature_schedule(step: int, iters: int, temp_start: float, temp_end: float) -> float:
     """
     Linear temperature schedule from `temp_start` down to `temp_end`.
 
@@ -148,9 +204,7 @@ def refine_layout(
     allow_annealing: bool = False,
     temp_start: float = 0.1,
     temp_end: float = 0.001,
-    temperature_schedule: Optional[
-        Callable[[int, int, float, float], float]
-    ] = None,
+    temperature_schedule: Optional[Callable[[int, int, float, float], float]] = None,
     track_stats: bool = False,
 ) -> float | LocalSearchStats:
     """
@@ -239,15 +293,14 @@ def refine_layout(
         tree.x, tree.y, tree.angle = new_x, new_y, new_angle
         tree.update()
 
-        # Collision check only against other trees
-        others = [p.poly for j, p in enumerate(poses) if j != idx]
-        index = STRtree(others)
-        cand_indices = index.query(tree.poly)
-
-        collision = any(
-            tree.poly.intersects(others[j]) and not tree.poly.touches(others[j])
-            for j in cand_indices
-        )
+        # Collision check against other trees (simple O(N) loop)
+        collision = False
+        for j, other in enumerate(poses):
+            if j == idx:
+                continue
+            if tree.poly.intersects(other.poly) and not tree.poly.touches(other.poly):
+                collision = True
+                break
 
         if collision:
             # Revert and reject
@@ -284,13 +337,14 @@ def refine_layout(
             rejected += 1
 
     if track_stats:
-        return LocalSearchStats(
+        stats = LocalSearchStats(
             initial_side=initial_side,
             final_side=best_side,
             accepted_moves=accepted,
             rejected_moves=rejected,
             improved_moves=improved,
         )
+        return stats
 
     return best_side
 
@@ -298,6 +352,7 @@ def refine_layout(
 __all__ = [
     "bounding_square_side",
     "has_any_collision",
+    "radial_compact_layout",
     "LocalSearchStats",
     "refine_layout",
 ]

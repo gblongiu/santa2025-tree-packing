@@ -34,35 +34,12 @@ from .config import (
     N_MAX_TREES,
     DATA_SUBMISSIONS_DIR,
     set_global_seeds,
-    LOCAL_SEARCH_DEFAULT_ITERS_SMALL,
-    LOCAL_SEARCH_DEFAULT_ITERS_MEDIUM,
-    LOCAL_SEARCH_DEFAULT_ITERS_LARGE,
+    local_search_iters_for_n,
 )
 from .geometry import TreePose
 
-# We deliberately import these lazily inside functions so that the module
-# can be imported before the packers are fully implemented, if needed.
-
-
-# ---------------------------------------------------------------------------
-# Helpers to choose local-search iterations per n
-# ---------------------------------------------------------------------------
-
-def choose_local_search_iters(n: int) -> int:
-    """
-    Heuristic schedule for number of local-search iterations as a function of n.
-
-    You can tune this however you like; the defaults come from config.py:
-
-    - small n (<= 20): more iterations per tree
-    - medium n (<= 100): moderate iterations
-    - large n (> 100): fewer iterations per tree
-    """
-    if n <= 20:
-        return LOCAL_SEARCH_DEFAULT_ITERS_SMALL
-    if n <= 100:
-        return LOCAL_SEARCH_DEFAULT_ITERS_MEDIUM
-    return LOCAL_SEARCH_DEFAULT_ITERS_LARGE
+# We deliberately import the packers lazily inside functions so that this module
+# can be imported before all packers are fully implemented, if needed.
 
 
 # ---------------------------------------------------------------------------
@@ -77,10 +54,11 @@ def build_layout_for_n(
     """
     Build a layout for a single puzzle with `n` trees.
 
-    Pipeline (by design, you can change later):
+    Pipeline:
 
     1. Use the hexagonal lattice baseline to produce a non-overlapping layout.
-    2. Optionally run hill-climbing local search to shrink the bounding square.
+    2. Optionally run a global radial compaction toward the origin.
+    3. Optionally run hill-climbing local search to shrink the bounding square.
 
     Parameters
     ----------
@@ -89,7 +67,8 @@ def build_layout_for_n(
     use_local_search:
         If False, only the hex baseline is used.
     local_search_iters:
-        If provided, override the default iteration count for this n.
+        If provided, override the default iteration count for this n, which
+        otherwise comes from `local_search_iters_for_n` in `config.py`.
 
     Returns
     -------
@@ -99,6 +78,7 @@ def build_layout_for_n(
     if n < 1 or n > N_MAX_TREES:
         raise ValueError(f"n must be in [1, {N_MAX_TREES}], got {n}")
 
+    # Baseline hexagonal layout
     from .packers.hex_lattice import initial_hex_layout_for_n
 
     poses: List[TreePose] = initial_hex_layout_for_n(n)
@@ -106,10 +86,18 @@ def build_layout_for_n(
     if not use_local_search:
         return poses
 
-    from .packers.local_search import refine_layout
+    # Import both global compaction and local search refinements.
+    from .packers.local_search import refine_layout, radial_compact_layout
 
-    iters = local_search_iters if local_search_iters is not None else choose_local_search_iters(n)
-    # refine_layout is expected to operate in-place on poses, returning the final best side length
+    # First: global radial compaction toward the origin
+    _scale = radial_compact_layout(poses)
+
+    # Then: local hill-climbing to nibble away at corners
+    iters = (
+        local_search_iters
+        if local_search_iters is not None
+        else local_search_iters_for_n(n)
+    )
     _final_side = refine_layout(poses, iters=iters)
     return poses
 
@@ -145,7 +133,6 @@ def build_submission_df(
     """
     set_global_seeds(seed)
 
-    all_poses: List[TreePose] = []
     ids: List[str] = []
     xs: List[float] = []
     ys: List[float] = []
@@ -159,7 +146,6 @@ def build_submission_df(
             )
 
         for idx, pose in enumerate(poses_n):
-            all_poses.append(pose)
             ids.append(f"{n:03d}_{idx}")
             xs.append(float(pose.x))
             ys.append(float(pose.y))
@@ -287,8 +273,10 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--output",
         type=str,
         default=None,
-        help="Optional output path for the CSV. If omitted, a timestamped name "
-             "will be created under data/submissions/.",
+        help=(
+            "Optional output path for the CSV. If omitted, a timestamped name "
+            "will be created under data/submissions/."
+        ),
     )
     return parser.parse_args(argv)
 
