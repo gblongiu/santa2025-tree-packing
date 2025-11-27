@@ -1,0 +1,8 @@
+numpy>=1.26
+pandas>=2.1
+shapely>=2.0
+matplotlib>=3.8
+jupyter>=1.0
+ipykernel>=6.29
+pytest>=8.0
+tqdm>=4.66
