@@ -47,3 +47,10 @@ data/submissions/*.zip
 # Misc
 *.swp
 *.swo
+
+# Coverage / testing
+.coverage
+htmlcov/
+
+# Ruff / other linters (if you ever use them)
+.ruff_cache/
